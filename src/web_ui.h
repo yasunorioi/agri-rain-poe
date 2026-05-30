@@ -4,22 +4,16 @@
 #pragma once
 
 #include <Arduino.h>
-#include <Ethernet.h>
+#include <ETH.h>
+#include <Network.h>
+#include <NetworkServer.h>
+#include <NetworkClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
 #include "sensors.h"
 #include "mqtt_pub.h"
 
-// arduino-libraries/Ethernet on ESP32 leaves Server::begin(uint16_t) pure
-// virtual. Provide the missing override so the class is instantiable.
-class EthernetServerWrap : public EthernetServer {
- public:
-  explicit EthernetServerWrap(uint16_t port) : EthernetServer(port) {}
-  using EthernetServer::begin;
-  void begin(uint16_t port) override { (void)port; EthernetServer::begin(); }
-};
-
-extern EthernetServerWrap g_webServer;
+extern NetworkServer g_webServer;
 extern const char *FW_VERSION;
 extern const char *FW_NAME;
 
@@ -145,16 +139,12 @@ inline String pageConfig() {
 
 inline String pageAbout() {
   String s = pageHead("About");
-  uint8_t mac[6];
-  Ethernet.MACAddress(mac);
-  char macStr[20];
-  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   s += F("<div class=sec><h3>About</h3><table>");
   s += "<tr><th>Firmware</th><td>"; s += FW_NAME; s += " "; s += FW_VERSION; s += "</td></tr>";
   s += "<tr><th>Node ID</th><td>";  s += g_cfg.node_id; s += "</td></tr>";
-  s += "<tr><th>MAC</th><td>";      s += macStr; s += "</td></tr>";
-  s += "<tr><th>IP</th><td>";       s += Ethernet.localIP().toString(); s += "</td></tr>";
+  s += "<tr><th>Hostname</th><td>"; s += g_cfg.hostname; s += ".local</td></tr>";
+  s += "<tr><th>MAC</th><td>";      s += ETH.macAddress(); s += "</td></tr>";
+  s += "<tr><th>IP</th><td>";       s += ETH.localIP().toString(); s += "</td></tr>";
   s += "<tr><th>Uptime</th><td>";   s += String(millis() / 1000); s += " s</td></tr>";
   s += F("</table></div></body></html>");
   return s;
@@ -167,7 +157,7 @@ inline String statusJson(bool linkUp, bool haveLease) {
   doc["raw_tips"]    = g_raw_tips;
   doc["work_min"]    = g_work_minutes;
   doc["uptime_s"]   = millis() / 1000;
-  doc["ip"]         = Ethernet.localIP().toString();
+  doc["ip"]         = ETH.localIP().toString();
   doc["link"]       = linkUp ? (haveLease ? "up" : "no-lease") : "down";
   doc["mqtt_host"]  = g_cfg.mqtt_host[0] ? g_cfg.mqtt_host : "";
   doc["mqtt_connected"] = g_mqtt.connected();
@@ -177,7 +167,7 @@ inline String statusJson(bool linkUp, bool haveLease) {
   return out;
 }
 
-inline void sendResponse(EthernetClient &c, int status, const char *contentType,
+inline void sendResponse(NetworkClient &c, int status, const char *contentType,
                          const String &body) {
   c.print("HTTP/1.0 "); c.print(status);
   c.println(status == 200 ? " OK" : (status == 303 ? " See Other" : " Error"));
@@ -188,7 +178,7 @@ inline void sendResponse(EthernetClient &c, int status, const char *contentType,
   c.print(body);
 }
 
-inline void sendRedirect(EthernetClient &c, const char *location) {
+inline void sendRedirect(NetworkClient &c, const char *location) {
   c.println("HTTP/1.0 303 See Other");
   c.print("Location: "); c.println(location);
   c.println("Content-Length: 0");
@@ -197,7 +187,7 @@ inline void sendRedirect(EthernetClient &c, const char *location) {
 }
 
 inline void handleWebClient(bool linkUp, bool haveLease) {
-  EthernetClient client = g_webServer.available();
+  NetworkClient client = g_webServer.accept();
   if (!client) return;
 
   String reqLine;

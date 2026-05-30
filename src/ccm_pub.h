@@ -7,8 +7,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include <Ethernet.h>
-#include <EthernetUdp.h>
+#include <NetworkUdp.h>
 #include "config.h"
 #include "sensors.h"
 
@@ -16,10 +15,13 @@ static const IPAddress CCM_MULTICAST(224, 0, 0, 1);
 static const uint16_t  CCM_PORT      = 16520;
 static const char* const UECS_VERSION = "1.00-E10";
 
-extern EthernetUDP g_ccmUDP;
+extern NetworkUDP g_ccmUDP;
 
 inline void ccmBegin() {
-  g_ccmUDP.begin(CCM_PORT);
+  // We only ever transmit, never receive, so a plain begin(0) is enough.
+  // beginMulticast() additionally calls igmp_joingroup, which errors on
+  // 224.0.0.1 (all-hosts is implicitly joined on every netif).
+  g_ccmUDP.begin(0);
 }
 
 inline bool ccmPublish() {

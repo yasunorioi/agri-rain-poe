@@ -5,19 +5,18 @@
 //   M5Stack ATOM Lite + ATOM PoE base (W5500 on SPI)
 //   SEN0575 on Grove: G26 (TX) -> sensor RX, G32 (RX) <- sensor TX, UART
 //
-// First flash via USB-C; subsequent flashes over Ethernet via ArduinoOTA.
+// Built on arduino-esp32 3.x (via the pioarduino fork). The W5500 runs
+// through ESP-IDF's spi_w5500 driver + lwIP, so ESPmDNS and ArduinoOTA
+// actually work — no W5500-offload-stack escape hatch needed.
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <Ethernet.h>
-#include <EthernetUdp.h>
+#include <ETH.h>
+#include <Network.h>
+#include <NetworkUdp.h>
 #include <PubSubClient.h>
-// ArduinoOTA pulls ESPmDNS which crashes ("Invalid mbox" in tcpip.c) when
-// the ESP-IDF lwIP tcpip thread isn't running — i.e. whenever we're on
-// Arduino-Ethernet via W5500 SPI instead of ESP32's native ETH driver. We
-// won't use OTA until we either migrate to the native driver or write a
-// W5500-side mDNS responder. Reflash via USB for now.
-// #include <ArduinoOTA.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <FastLED.h>
 
 #include "config.h"
@@ -28,13 +27,15 @@
 #include "led_state.h"
 
 const char *FW_NAME    = "agri-rain-poe";
-const char *FW_VERSION = "0.2.0";
+const char *FW_VERSION = "0.3.0";
 
 // W5500 SPI pinout (M5 ATOM PoE base)
 static const int PIN_W5500_SCK  = 22;
 static const int PIN_W5500_MISO = 23;
 static const int PIN_W5500_MOSI = 33;
 static const int PIN_W5500_CS   = 19;
+static const int PIN_W5500_IRQ  = -1;
+static const int PIN_W5500_RST  = -1;
 
 // globals declared extern in headers
 Config g_cfg;
@@ -45,50 +46,69 @@ uint32_t g_raw_tips        = 0;
 uint16_t g_work_minutes    = 0;
 HardwareSerial SensorSerial(1);  // UART1
 
-EthernetUDP    g_ccmUDP;
-EthernetClient g_ethClient;
-PubSubClient   g_mqtt(g_ethClient);
-EthernetServerWrap g_webServer(80);
+NetworkUDP    g_ccmUDP;
+NetworkClient g_ethClient;
+PubSubClient  g_mqtt(g_ethClient);
+NetworkServer g_webServer(80);
 
 CRGB g_led[NEOPIXEL_NUM];
 LedState g_led_state = LED_BOOT;
 
+// Filled in by network events, read by loop().
 static bool g_link_up    = false;
 static bool g_have_lease = false;
 
-static void macFromEfuse(uint8_t mac[6]) {
-  uint64_t chip = ESP.getEfuseMac();
-  mac[0] = 0x02;  // locally administered, unicast
-  mac[1] = (chip >> 8)  & 0xFF;
-  mac[2] = (chip >> 16) & 0xFF;
-  mac[3] = (chip >> 24) & 0xFF;
-  mac[4] = (chip >> 32) & 0xFF;
-  mac[5] = (chip >> 40) & 0xFF;
-}
-
-static void ethernetBegin() {
-  SPI.begin(PIN_W5500_SCK, PIN_W5500_MISO, PIN_W5500_MOSI, PIN_W5500_CS);
-  Ethernet.init(PIN_W5500_CS);
-  uint8_t mac[6];
-  macFromEfuse(mac);
-  Serial.printf("[NET] MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  Serial.print("[NET] DHCP…");
-  if (Ethernet.begin(mac, 8000, 4000) == 1) {
-    g_have_lease = true;
-    IPAddress ip = Ethernet.localIP();
-    Serial.printf(" %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
-  } else {
-    g_have_lease = false;
-    Serial.println(" failed");
+static void onNetworkEvent(arduino_event_id_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      ETH.setHostname(g_cfg.hostname);
+      Serial.println("[ETH] start");
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      g_link_up = true;
+      Serial.println("[ETH] link UP");
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      g_link_up = false;
+      g_have_lease = false;
+      Serial.println("[ETH] link DOWN");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      g_have_lease = true;
+      Serial.printf("[ETH] IP %s\n", ETH.localIP().toString().c_str());
+      break;
+    case ARDUINO_EVENT_ETH_LOST_IP:
+      g_have_lease = false;
+      Serial.println("[ETH] lost IP");
+      break;
+    default: break;
   }
 }
 
-static void ethernetMaintain() {
-  EthernetLinkStatus link = Ethernet.linkStatus();
-  g_link_up = (link == LinkON);
-  if (g_link_up && !g_have_lease) ethernetBegin();
-  if (g_link_up && g_have_lease)  Ethernet.maintain();
+static void ethernetBegin() {
+  SPI.begin(PIN_W5500_SCK, PIN_W5500_MISO, PIN_W5500_MOSI);
+  if (!ETH.begin(ETH_PHY_W5500, /*phy_addr*/1,
+                 PIN_W5500_CS, PIN_W5500_IRQ, PIN_W5500_RST,
+                 SPI, /*spi_freq_mhz*/20)) {
+    Serial.println("[ETH] ETH.begin failed");
+  }
+}
+
+static void mdnsBegin() {
+  if (!MDNS.begin(g_cfg.hostname)) {
+    Serial.println("[MDNS] begin failed");
+    return;
+  }
+  MDNS.addService("http", "tcp", 80);
+  Serial.printf("[MDNS] %s.local\n", g_cfg.hostname);
+}
+
+static void otaBegin() {
+  ArduinoOTA.setHostname(g_cfg.hostname);
+  ArduinoOTA.onStart([]{ Serial.println("[OTA] start"); });
+  ArduinoOTA.onEnd  ([]{ Serial.println("[OTA] end");   });
+  ArduinoOTA.onError([](ota_error_t e){ Serial.printf("[OTA] err %u\n", e); });
+  ArduinoOTA.begin();
 }
 
 void setup() {
@@ -107,17 +127,29 @@ void setup() {
 
   sensorsBegin();
   detectSensor();
+
+  Network.onEvent(onNetworkEvent);
   ethernetBegin();
+
+  // Wait briefly for DHCP so mDNS / OTA / MQTT come up at a sensible moment.
+  uint32_t t0 = millis();
+  while (!g_have_lease && millis() - t0 < 8000) {
+    delay(50);
+  }
+  if (!g_have_lease) Serial.println("[NET] no DHCP yet — continuing");
+
   ccmBegin();
   g_webServer.begin();
   g_mqtt.setBufferSize(512);
   g_mqtt.setKeepAlive(30);
+  mdnsBegin();
+  otaBegin();
 
   Serial.println("[BOOT] ready");
 }
 
 void loop() {
-  ethernetMaintain();
+  ArduinoOTA.handle();
   handleWebClient(g_link_up, g_have_lease);
 
   uint32_t now = millis();
