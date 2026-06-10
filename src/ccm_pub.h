@@ -15,7 +15,7 @@ inline bool ccmPublish() {
   dtostrf(rainfallMm(), 1, 4, buf);
 
   String xml = agri::ccmEnvelopeOpen();
-  xml += agri::ccmDatum("WRainfallAmt",
+  xml += agri::ccmDatumNT("WRainfallAmt", g_cfg.common.ccm_ntype,
                         g_cfg.common.ccm_room,
                         g_cfg.common.ccm_region,
                         g_cfg.ccm_order,

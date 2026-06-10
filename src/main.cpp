@@ -12,7 +12,7 @@
 #include "ccm_pub.h"
 
 const char *FW_NAME     = "agri-rain-poe";
-const char *FW_VERSION  = "0.5.0";
+const char *FW_VERSION  = "0.6.0";
 const char *FW_REPO     = "yasunorioi/agri-rain-poe";
 const char *FW_BIN_NAME = "agri-rain-poe.bin";
 
